@@ -9,10 +9,8 @@
  *    - Execute as: Me
  *    - Who has access: Anyone
  * 4. Copy URL /exec dán vào Tweaks "apiUrl" trên trang Frontend & CRM.
- * 5. SEEPAY: cài trên tài khoản MB Bank (nhận tiền gói 199K trả trước).
- *    Vào Seepay → Webhook → dán URL /exec (Content-Type JSON).
- *    QR KHÔNG ghi nội dung CK → đối soát theo SỐ TIỀN CHÍNH XÁC của đơn pending_payment.
- *    Các gói còn lại thanh toán Nam Á Bank SAU khi nâng cấp thành công (KTV chốt đơn tay).
+ * 5. Luồng đơn: Khách đặt → KTV kích hoạt → Khách kiểm tra → KTV gửi bill → Admin duyệt → paid_success.
+ *    Mọi thanh toán qua KTV, KHÔNG QR/CDK tự động.
  * ============================================================
  */
 
@@ -28,8 +26,6 @@ var TELEGRAM_BOT_TOKEN = '8916450324:AAHgiI4mIN5WYpSdN-sISD3Ofr6SUfRdXpE';
 var TELEGRAM_CHAT_IDS = ['872658011'];
 var DRIVE_FOLDER_NAME = 'GGCLOUD_PAYMENT_PROOFS';
 var FOMO_MINUTES = 30;
-var CDK_ACTIVATION_URL = 'https://trialpixel.live';
-var SEEPAY_API_KEY = 'AIDGPKW1IQEOARQ7UOV042FSA1YJP6RUKCSB5FYYOTOLPWXIMZBH6HC4M8T3SDDL'; // API token Seepay (my.sepay.vn → API Access)
 var COMMISSION_RATE = 0.20;      // Hoa hồng CTV 20% — CHỈ tính cho gói có ctv:true (199K/299K/399K)
 var CTV_DISCOUNT_RATE = 0.05;    // Khách nhập mã CTV: giảm 5% — CHỈ gói có ctv:true (199K/299K/399K)
 
@@ -38,15 +34,13 @@ var MAX_WITHDRAWALS_PER_DAY = 2;   // Giới hạn số lệnh rút / CTV / ngà
 var MIN_WITHDRAW_AMOUNT = 50000;   // Số tiền rút tối thiểu mỗi lệnh
 var ADMIN_CHAT_URL = 'https://t.me/+DGh5eC0Ce2EwOTc9';  // Link chat Admin (CTV bấm khi đơn rút quá 4 giờ).
 
-// flow: 'manual'  = Nâng cấp trước – Thanh toán sau (KTV kích hoạt)
-// flow: 'cdk'     = Gói tự nâng cấp: thanh toán trước → nhả mã CDK tự động
-// ctv: true = gói được tính hoa hồng CTV 20% + khách nhập mã được giảm 5% (gói 9K/99K không tính)
+// flow: 'manual'  = Nâng cấp trước – Kiểm tra – Thanh toán sau (KTV kích hoạt, KTV tự gửi thông tin thanh toán)
+// ctv: true = gói được tính hoa hồng CTV 20% + khách nhập mã được giảm 5% (chỉ áp dụng gói 12 tháng)
+// CHIẾN LƯỢC MỚI: 3 gói, mọi khâu qua KTV, KHÔNG QR/CDK tự động.
 var PACKAGES = {
-  '9K':   { amount: 9000,   cogs: 5000,  flow: 'manual', ctv: false }, // 1 tháng — trả sau, KHÔNG hoa hồng CTV
-  '99K':  { amount: 99000,  cogs: 5000,  flow: 'manual', ctv: false }, // 3 tháng — trả sau, KHÔNG hoa hồng CTV
-  '199K': { amount: 199000, cogs: 30000, flow: 'cdk',    ctv: true },  // 12 tháng tự nâng cấp (CDK) — TRẢ TRƯỚC 100%
-  '299K': { amount: 299000, cogs: 5000,  flow: 'manual', ctv: true },  // 12 tháng có KTV hỗ trợ — trả sau
-  '399K': { amount: 399000, cogs: 35000, flow: 'manual', ctv: true }   // 18 tháng chủ lực — trả sau
+  '1THANG':  { amount: 29000,  cogs: 5000,  flow: 'manual', ctv: false }, // 1 tháng dùng thử — trả sau, KHÔNG hoa hồng CTV
+  '12THANG': { amount: 499000, cogs: 20000, flow: 'manual', ctv: true },  // 12 tháng toàn diện — trả sau, hoa hồng CTV 20%
+  '18THANG': { amount: 699000, cogs: 25000, flow: 'manual', ctv: true }   // 18 tháng ultimate — trả sau, hoa hồng CTV 20%
 };
 
 // ================== KHỞI TẠO DATABASE ==================
@@ -58,7 +52,6 @@ function setupDatabase() {
     sheet_ctvs: ['id', 'gmail', 'ctv_code', 'balance_accumulated', 'status'],
     sheet_cdk_pool: ['id', 'cdk_code', 'status', 'order_id', 'distributed_at'],
     sheet_transactions: ['id', 'type', 'ctv_code', 'order_id', 'amount', 'note', 'created_at'],
-    sheet_operational_costs: ['id', 'cost_type', 'amount', 'note', 'recorded_date'],
     sheet_withdrawals: ['id', 'ctv_code', 'gmail', 'amount', 'bank_name', 'bank_account', 'account_holder', 'status', 'created_at', 'processed_at']
   };
   Object.keys(defs).forEach(function (name) {
@@ -77,16 +70,13 @@ function setupDatabase() {
   if (users.getLastRow() === 1) {
     users.appendRow(['TKAdmin01', 'admin', sha256_('admin123'), 'Danh', 'ADMIN', 'Hoạt động']);
     users.appendRow(['TKTho01', 'tho01', sha256_('tho123'), 'Hương', 'KTV', 'Hoạt động']);
-    // CTV đăng nhập CRM: username = gmail của CTV trong sheet_ctvs
-    users.appendRow(['TKCtv01', 'demo@gmail.com', sha256_('ctv123'), 'Đan (CTV)', 'CTV', 'Hoạt động']);
   }
-  // Kho CDK mẫu — thay bằng mã thật qua tab "Kho CDK" trên CRM
-  var pool = ss.getSheetByName('sheet_cdk_pool');
-  if (pool.getLastRow() === 1) {
-    ['DEMO-CDK-0001-AAAA', 'DEMO-CDK-0002-BBBB', 'DEMO-CDK-0003-CCCC'].forEach(function (c, i) {
-      pool.appendRow(['CDK' + ('000' + (i + 1)).slice(-4), c, 'available', '', '']);
-    });
+  // CTV mẫu để test đăng nhập Ví CTV (mật khẩu cố định trên Frontend là cvt123)
+  var ctvs = ss.getSheetByName('sheet_ctvs');
+  if (ctvs.getLastRow() === 1) {
+    ctvs.appendRow(['CTV001', 'demo@gmail.com', 'CTV-DEMO01', 0, 1]);
   }
+
 }
 
 // ================== ROUTER ==================
@@ -97,11 +87,7 @@ function doGet(e) {
 function doPost(e) {
   var body = {};
   try { body = JSON.parse(e.postData.contents || '{}'); } catch (err) {}
-  // Seepay webhook: payload không có "action" nhưng có transferAmount + content
-  if (body && !body.action && (body.transferAmount !== undefined || body.transaction_content !== undefined)) {
-    return ContentService.createTextOutput(JSON.stringify(seepayWebhook(body)))
-      .setMimeType(ContentService.MimeType.JSON);
-  }
+  // Webhook đã bỏ (không còn QR/Seepay)
   return route_(e, body);
 }
 
@@ -116,20 +102,17 @@ function route_(e, body) {
       case 'activateOrder': out = activateOrder(p); break;
       case 'completeOrder': out = completeOrder(p); break;
       case 'registerCTV':   out = registerCTV(p); break;
+      case 'loginCTV':      out = loginCTV(p); break;
       case 'checkCTV':      out = checkCTV(e.parameter.ctv_code || p.ctv_code, e.parameter.package_type || p.package_type); break;
       case 'login':         out = login(p); break;
       case 'getOrders':     out = getOrders(e.parameter || p); break;
       case 'getCTVs':       out = getCTVs(); break;
-      case 'addCost':       out = addCost(p); break;
       case 'getDashboard':  out = getDashboard(p); break;
       case 'ctvPortal':     out = ctvPortal(p); break;
-      case 'getCDKPool':    out = getCDKPool(); break;
-      case 'addCDKs':       out = addCDKs(p); break;
       case 'requestWithdraw': out = requestWithdraw(p); break;
       case 'getWithdrawals':  out = getWithdrawals(e.parameter || p); break;
       case 'approveWithdraw': out = approveWithdraw(p); break;
       case 'rejectWithdraw':  out = rejectWithdraw(p); break;
-      case 'seepay':        out = seepayWebhook(p); break;
       default: out = { success: false, error: 'Unknown action: ' + action };
     }
   } catch (err) {
@@ -230,7 +213,7 @@ function formatZaloMsg_(p) {
   var vnd = function (n) { return Number(n || 0).toLocaleString('vi-VN') + 'đ'; };
   if (p.event === 'new_order') {
     return '🛒 ĐƠN HÀNG MỚI #' + p.order_id +
-      '\n📦 Gói: ' + p.package + (p.flow === 'cdk' ? ' (CDK — trả trước)' : ' (nâng cấp trước — trả sau)') +
+      '\n📦 Gói: ' + p.package + ' (nâng cấp trước — trả sau)' +
       '\n📧 Gmail: ' + (p.gmail || '(không có)') +
       '\n📞 SĐT/Zalo: ' + p.phone +
       '\n💰 Số tiền thanh toán: ' + vnd(p.amount) +
@@ -243,7 +226,6 @@ function formatZaloMsg_(p) {
       '\n💰 Số tiền: ' + vnd(p.amount) +
       '\n🔍 Nguồn xác thực: ' + p.source +
       (p.ctv_code ? '\n🎟 CTV ' + p.ctv_code + ' nhận hoa hồng ' + vnd(p.commission_ctv) : '') +
-      (p.cdk_code ? '\n🔐 Đã nhả mã CDK: ' + p.cdk_code : '') +
       '\n⏰ ' + p.at;
   }
   if (p.event === 'underpaid') {
@@ -256,7 +238,7 @@ function formatZaloMsg_(p) {
 }
 
 // ================== 1. VALIDATE & ÁP MÃ CTV ==================
-// Hoa hồng 20% + giảm 5% cho khách: CHỈ áp dụng gói có ctv:true (199K/299K/399K).
+// Hoa hồng 20% + giảm 5% cho khách: CHỈ áp dụng gói có ctv:true (12T/18T).
 function validateAndApplyCTV(packageType, ctvCode, originalAmount) {
   var discountAmount = 0, amountToPay = originalAmount, commissionCTV = 0, isValidCTV = false;
   var pkg = PACKAGES[packageType];
@@ -299,7 +281,7 @@ function checkCTV(ctvCode, packageType) {
   if (r.is_ctv_code_accepted) {
     msg = 'Áp dụng mã CTV thành công! Bạn được giảm 5% — người giới thiệu nhận hoa hồng 20%.';
   } else {
-    msg = pkg.ctv ? 'Mã CTV không tồn tại hoặc đã bị khóa.' : 'Mã CTV chỉ áp dụng cho gói 199K / 299K / 399K.';
+    msg = pkg.ctv ? 'Mã CTV không tồn tại hoặc đã bị khóa.' : 'Mã CTV chỉ áp dụng cho gói 12 tháng &amp; 18 tháng.';
   }
   return {
     success: true,
@@ -310,38 +292,22 @@ function checkCTV(ctvCode, packageType) {
 }
 
 // ================== 2. TẠO ĐƠN HÀNG ==================
-// Gói manual: pending_activation → (KTV) activated → paid_success
-// Gói cdk:    pending_payment → (Seepay/bill) paid_success + nhả mã CDK
+// Luồng đơn: pending_activation → (KTV) activated → (KTV up bill) paid_success
 function createOrder(p) {
   var gmail = String(p.customer_gmail || '').trim().toLowerCase();
   var phone = String(p.customer_phone || '').trim();
   var packageType = String(p.package_type || '').trim();
   var pkg = PACKAGES[packageType];
-  if (!pkg) return { success: false, error: 'Gói không hợp lệ (9K/99K/199K/299K/399K)' };
+  if (!pkg) return { success: false, error: 'Gói không hợp lệ (1THANG/12THANG/18THANG)' };
   if (!phone) return { success: false, error: 'Thiếu số điện thoại' };
-  // Gói CDK không bắt buộc gmail (không đòi hỏi thông tin tài khoản)
-  if (pkg.flow !== 'cdk' && (!gmail || !/^\S+@\S+\.\S+$/.test(gmail))) return { success: false, error: 'Gmail không hợp lệ' };
-  if (gmail && !/^\S+@\S+\.\S+$/.test(gmail)) return { success: false, error: 'Gmail không hợp lệ' };
+  if (!gmail || !/^\S+@\S+\.\S+$/.test(gmail)) return { success: false, error: 'Gmail không hợp lệ' };
 
   var ctv = validateAndApplyCTV(packageType, p.applied_ctv_code, pkg.amount);
   var sh = sheet_('sheet_orders');
   var id = nextId_(sh);
-  var commissionKTV = pkg.flow === 'cdk' ? 0 : Math.round(ctv.amount * 0.05);
-  var initialStatus = pkg.flow === 'cdk' ? 'pending_payment' : 'pending_activation';
-
-  // Gói trả trước (CDK): trừ "số lẻ định danh" 1–999đ để mỗi đơn có SỐ TIỀN DUY NHẤT
-  // (QR không ghi nội dung CK — Seepay đối soát theo số tiền chính xác).
+  var commissionKTV = Math.round(ctv.amount * 0.05);
+  var initialStatus = 'pending_activation';
   var finalAmount = ctv.amount;
-  if (pkg.flow === 'cdk') {
-    var taken = {};
-    var od = sh.getDataRange().getValues();
-    for (var q = 1; q < od.length; q++) {
-      if (od[q][7] === 'pending_payment') taken[Number(od[q][6] || 0)] = true;
-    }
-    var off;
-    do { off = 1 + Math.floor(Math.random() * 999); } while (taken[ctv.amount - off]);
-    finalAmount = ctv.amount - off;
-  }
 
   sh.appendRow([id, gmail, phone, packageType, pkg.amount, ctv.discount_amount, finalAmount,
     initialStatus, '', commissionKTV, ctv.applied_ctv_code, ctv.commission_ctv,
@@ -354,73 +320,27 @@ function createOrder(p) {
   });
 
   return {
-    success: true, order_id: id, package_type: packageType, flow: pkg.flow,
+    success: true, order_id: id, package_type: packageType, flow: 'manual',
     transfer_note: 'GGCLOUD' + id,
     financials: { original_price: pkg.amount, discount_applied: ctv.discount_amount, final_amount_to_pay: finalAmount },
     is_ctv_code_accepted: ctv.is_ctv_code_accepted,
     status: initialStatus,
-    message: pkg.flow === 'cdk'
-      ? 'Đơn CDK đã tạo. Quét QR thanh toán để nhận mã kích hoạt ngay lập tức.'
-      : 'Tạo đơn thành công.'
+    message: 'Tạo đơn thành công. KTV sẽ liên hệ qua Zalo để nâng cấp.'
   };
 }
 
 // ================== 3. TRẠNG THÁI + ĐẾM NGƯỢC FOMO ==================
-// ================== 3B. ĐỐI SOÁT CHỦ ĐỘNG QUA API SEEPAY ==================
-// Gọi danh sách giao dịch gần nhất từ Seepay (tài khoản MB). QR không ghi nội dung CK
-// → khớp theo SỐ TIỀN CHÍNH XÁC (hoặc mã GGCLOUD<id> nếu khách lỡ ghi) → markPaid_.
-// Dùng khi khách đang chờ ở màn hình QR (poll getStatus).
-function checkSeepayApi_(rowIndex, data) {
-  if (!SEEPAY_API_KEY) return null;
-  var r = data[rowIndex];
-  var id = String(r[0]);
-  var due = Number(r[6] || 0);
-  try {
-    var resp = UrlFetchApp.fetch('https://my.sepay.vn/userapi/transactions/list?limit=25', {
-      headers: { Authorization: 'Bearer ' + SEEPAY_API_KEY },
-      muteHttpExceptions: true
-    });
-    if (resp.getResponseCode() !== 200) return null;
-    var body = JSON.parse(resp.getContentText() || '{}');
-    var txs = body.transactions || [];
-    for (var t = 0; t < txs.length; t++) {
-      var content = String(txs[t].transaction_content || '');
-      var amountIn = Number(txs[t].amount_in || 0);
-      var m = content.match(/GGCLOUD\s*(\d{4,})/i);
-      // Khớp theo mã đơn (nếu có trong nội dung) HOẶC theo số tiền chính xác (QR không ghi nội dung CK)
-      if ((m && String(m[1]) === id && amountIn >= due) || (!m && amountIn === due)) {
-        return markPaid_(rowIndex, data, 'seepay_api_poll', '');
-      }
-    }
-  } catch (err) {}
-  return null;
-}
-
 function getOrderStatus(orderId) {
   expireOverdue_();
   var data = sheet_('sheet_orders').getDataRange().getValues();
   for (var i = 1; i < data.length; i++) {
     if (String(data[i][0]) === String(orderId)) {
-      // Đơn CDK đang chờ tiền → chủ động đối soát API Seepay
-      if (data[i][7] === 'pending_payment') {
-        var paid = checkSeepayApi_(i, data);
-        if (paid && paid.success) {
-          var out = { success: true, order_id: data[i][0], status: 'paid_success', amount: data[i][6], countdown_seconds: 0 };
-          if (paid.cdk_code) { out.cdk_code = paid.cdk_code; out.activation_url = CDK_ACTIVATION_URL; }
-          return out;
-        }
-      }
       var status = data[i][7];
       var res = { success: true, order_id: data[i][0], status: status, amount: data[i][6], countdown_seconds: 0 };
       if (status === 'activated' && data[i][14]) {
         var activatedAt = new Date(data[i][14]);
         var elapsed = Math.floor((Date.now() - activatedAt.getTime()) / 1000);
         res.countdown_seconds = Math.max(0, FOMO_MINUTES * 60 - elapsed);
-      }
-      // Gói CDK đã thanh toán → trả mã cho Frontend hiển thị
-      if (status === 'paid_success' && data[i][16]) {
-        res.cdk_code = String(data[i][16]);
-        res.activation_url = CDK_ACTIVATION_URL;
       }
       return res;
     }
@@ -457,7 +377,7 @@ function markPaid_(rowIndex, data, source, proofUrl) {
   sh.getRange(rowIndex + 1, 8).setValue('paid_success');
   if (proofUrl) sh.getRange(rowIndex + 1, 16).setValue(proofUrl);
 
-  // 1) Giải ngân hoa hồng CTV (chỉ gói 199K/299K/399K — commission_ctv đã gate lúc tạo đơn)
+  // 1) Giải ngân hoa hồng CTV (gói 12T/18T — commission_ctv đã gate lúc tạo đơn)
   var ctvCode = String(r[10] || '');
   var commission = Number(r[11] || 0);
   if (ctvCode && commission > 0) {
@@ -472,46 +392,14 @@ function markPaid_(rowIndex, data, source, proofUrl) {
     }
   }
 
-  // 2) Nhả mã CDK (gói cdk)
-  var pkg = PACKAGES[String(r[3])];
-  var cdkCode = '';
-  if (pkg && pkg.flow === 'cdk') {
-    cdkCode = dispenseCDK_(id);
-    if (cdkCode) sh.getRange(rowIndex + 1, 17).setValue(cdkCode);
-  }
-
   notify_({
     event: 'order_paid', order_id: id, source: source, package: String(r[3]),
-    amount: Number(r[6] || 0), ctv_code: ctvCode, commission_ctv: commission,
-    cdk_code: cdkCode || undefined, at: nowStr_()
+    amount: Number(r[6] || 0), ctv_code: ctvCode, commission_ctv: commission, at: nowStr_()
   });
 
   var out = { success: true, order_id: id, status: 'paid_success' };
-  if (cdkCode) { out.cdk_code = cdkCode; out.activation_url = CDK_ACTIVATION_URL; }
-  if (pkg && pkg.flow === 'cdk' && !cdkCode) out.warning = 'KHO CDK ĐÃ HẾT MÃ — liên hệ CSKH cấp bù thủ công!';
   if (proofUrl) out.payment_proof_url = proofUrl;
   return out;
-}
-
-// Rút 1 mã CDK chưa dùng từ kho, gắn với đơn hàng. Dùng LockService chống trùng.
-function dispenseCDK_(orderId) {
-  var lock = LockService.getScriptLock();
-  try { lock.waitLock(10000); } catch (err) { return ''; }
-  try {
-    var sh = sheet_('sheet_cdk_pool');
-    var data = sh.getDataRange().getValues();
-    for (var i = 1; i < data.length; i++) {
-      if (String(data[i][2]) === 'available') {
-        sh.getRange(i + 1, 3).setValue('distributed');
-        sh.getRange(i + 1, 4).setValue(orderId);
-        sh.getRange(i + 1, 5).setValue(nowStr_());
-        return String(data[i][1]);
-      }
-    }
-    return '';
-  } finally {
-    lock.releaseLock();
-  }
 }
 
 // completeOrder: khách bấm "đã thanh toán" / tải bill lên (phương án dự phòng duyệt tay)
@@ -541,42 +429,7 @@ function completeOrder(p) {
   return { success: false, error: 'Không tìm thấy đơn hàng' };
 }
 
-// ================== 5B. SEEPAY WEBHOOK — TỰ ĐỘNG CHECK TIỀN ==================
-// Seepay (tài khoản MB) bắn POST JSON khi có biến động số dư. Đối soát:
-//   Ưu tiên 1: nội dung CK chứa "GGCLOUD<order_id>" (nếu khách lỡ ghi) + đủ tiền → markPaid_
-//   Ưu tiên 2: QR KHÔNG ghi nội dung → khớp SỐ TIỀN CHÍNH XÁC với đơn pending_payment mới nhất
-function seepayWebhook(body) {
-  var content = String(body.content || body.transaction_content || body.description || '');
-  var amount = Number(body.transferAmount || body.amount_in || body.amount || 0);
-  var type = String(body.transferType || 'in').toLowerCase();
-  if (type === 'out') return { success: true, ignored: true, reason: 'Giao dịch tiền ra — bỏ qua' };
 
-  var data = sheet_('sheet_orders').getDataRange().getValues();
-
-  // Ưu tiên 1: có mã đơn trong nội dung CK
-  var m = content.match(/GGCLOUD\s*(\d{4,})/i);
-  if (m) {
-    for (var i = 1; i < data.length; i++) {
-      if (String(data[i][0]) === String(m[1])) {
-        var due = Number(data[i][6] || 0);
-        if (amount < due) {
-          notify_({ event: 'underpaid', order_id: m[1], received: amount, due: due });
-          return { success: false, error: 'Số tiền nhận (' + amount + ') nhỏ hơn giá trị đơn (' + due + ')' };
-        }
-        return markPaid_(i, data, 'seepay_webhook', '');
-      }
-    }
-  }
-
-  // Ưu tiên 2: khớp số tiền chính xác với đơn đang chờ thanh toán (mới nhất trước)
-  for (var j = data.length - 1; j >= 1; j--) {
-    if (data[j][7] === 'pending_payment' && Number(data[j][6] || 0) === amount) {
-      return markPaid_(j, data, 'seepay_webhook_amount', '');
-    }
-  }
-  notify_({ event: 'unmatched_payment', received: amount, content: content });
-  return { success: false, error: 'Không khớp được giao dịch ' + amount + 'đ với đơn nào đang chờ thanh toán' };
-}
 
 // ================== 6. ĐĂNG KÝ CTV (CHỐNG SPAM) ==================
 function registerCTV(p) {
@@ -610,6 +463,29 @@ function registerCTV(p) {
 
   cs.appendRow(['CTV' + ('000' + cs.getLastRow()).slice(-3), gmail, code, 0, 1]);
   return { success: true, ctv_code: code, existed: false, message: 'Đăng ký CTV thành công!' };
+}
+
+// ================== 6B. ĐĂNG NHẬP VÍ CTV (Frontend) ==================
+// Frontend gửi { gmail, password }. Mật khẩu CTV cố định = 'cvt123'.
+// Trả về số dư khả dụng / đóng băng / tổng thu nhập + số khách đã giới thiệu.
+function loginCTV(p) {
+  var gmail = String(p.gmail || '').trim().toLowerCase();
+  var pass = String(p.password || '');
+  if (!gmail || !/^\S+@\S+\.\S+$/.test(gmail)) return { success: false, error: 'Gmail không hợp lệ' };
+  if (pass !== 'cvt123') return { success: false, error: 'Mật khẩu CTV không đúng.' };
+  var ctv = findCTV_(null, gmail);
+  if (!ctv) return { success: false, error: 'Gmail này chưa đăng ký CTV. Vui lòng đăng ký CTV trước.' };
+  if (Number(ctv.status) !== 1) return { success: false, error: 'Tài khoản CTV đang bị khóa.' };
+  var orders = sheet_('sheet_orders').getDataRange().getValues();
+  var refCount = 0;
+  for (var i = 1; i < orders.length; i++) {
+    if (String(orders[i][10]).toUpperCase() === ctv.ctv_code) refCount++;
+  }
+  var w = walletSummary_(ctv.ctv_code, ctv.balance_accumulated);
+  return {
+    success: true, name: String(ctv.gmail).split('@')[0], ctv_code: ctv.ctv_code,
+    balance: w.available, frozen: w.frozen, total_income: w.total, ref_count: refCount
+  };
 }
 
 // ================== 7. CRM: LOGIN ==================
@@ -828,53 +704,15 @@ function getCTVs() {
   return { success: true, ctvs: rows };
 }
 
-// ================== 8B. CRM: KHO MÃ CDK (ADMIN) ==================
-function getCDKPool() {
-  var data = sheet_('sheet_cdk_pool').getDataRange().getValues();
-  var rows = [];
-  var available = 0, distributed = 0;
-  for (var i = data.length - 1; i >= 1; i--) {
-    var r = data[i];
-    if (String(r[2]) === 'available') available++; else distributed++;
-    rows.push({ id: r[0], cdk_code: String(r[1]), status: String(r[2]), order_id: String(r[3] || ''), distributed_at: String(r[4] || '') });
-    if (rows.length >= 300) break;
-  }
-  return { success: true, cdks: rows, counts: { available: available, distributed: distributed } };
-}
 
-// p.codes: chuỗi nhiều mã, phân tách bằng xuống dòng / dấu phẩy
-function addCDKs(p) {
-  var raw = String(p.codes || '');
-  var codes = raw.split(/[\n,;]+/).map(function (s) { return s.trim(); }).filter(Boolean);
-  if (!codes.length) return { success: false, error: 'Chưa nhập mã CDK nào' };
-  var sh = sheet_('sheet_cdk_pool');
-  var data = sh.getDataRange().getValues();
-  var existing = {};
-  for (var i = 1; i < data.length; i++) existing[String(data[i][1]).toUpperCase()] = true;
-  var added = 0, skipped = 0;
-  codes.forEach(function (c) {
-    if (existing[c.toUpperCase()]) { skipped++; return; }
-    existing[c.toUpperCase()] = true;
-    sh.appendRow(['CDK' + ('000' + sh.getLastRow()).slice(-4), c, 'available', '', '']);
-    added++;
-  });
-  return { success: true, added: added, skipped_duplicates: skipped };
-}
 
-// ================== 9. CRM: CHI PHÍ VẬN HÀNH ==================
-function addCost(p) {
-  var sh = sheet_('sheet_operational_costs');
-  var id = 'CP' + ('000' + sh.getLastRow()).slice(-4);
-  sh.appendRow([id, p.cost_type || 'operation', Number(p.amount || 0), p.note || '',
-    Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd')]);
-  return { success: true, id: id };
-}
+
 
 // ================== 10. CRM: DASHBOARD TÀI CHÍNH ==================
 // p.period: 'day' | 'month' | 'year' | 'all' (mặc định 'all')
+// ĐÃ BỮ: mục tiêu doanh thu & chi phí vận hành.
 function getDashboard(p) {
   expireOverdue_();
-  var GOAL_TARGET = 2000000000; // Mục tiêu doanh thu 2 tỷ
   var orders = sheet_('sheet_orders').getDataRange().getValues();
   var now = new Date();
   var dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
@@ -886,8 +724,7 @@ function getDashboard(p) {
 
   var rev = { day: 0, week: 0, month: 0, year: 0, total: 0, period: 0 };
   var cogs = 0, comKtv = 0, comCtv = 0;
-  var counts = { pending_activation: 0, pending_payment: 0, activated: 0, paid_success: 0, expired_unpaid: 0 };
-  var firstPaid = 0;
+  var counts = { pending_activation: 0, activated: 0, paid_success: 0, expired_unpaid: 0 };
   var ctvSales = {}; // ctv_code -> {revenue, orders} trong chu kỳ lọc
 
   for (var i = 1; i < orders.length; i++) {
@@ -902,7 +739,6 @@ function getDashboard(p) {
     if (t >= monthStart) rev.month += amt;
     if (t >= yearStart) rev.year += amt;
     if (t >= periodStart) rev.period += amt;
-    if (!firstPaid || t < firstPaid) firstPaid = t;
     var code = String(r[10] || '').toUpperCase();
     if (code && t >= periodStart) {
       if (!ctvSales[code]) ctvSales[code] = { ctv_code: code, revenue: 0, orders: 0 };
@@ -914,10 +750,6 @@ function getDashboard(p) {
     comCtv += Number(r[11] || 0);
   }
 
-  var costs = sheet_('sheet_operational_costs').getDataRange().getValues();
-  var opCost = 0;
-  for (var j = 1; j < costs.length; j++) opCost += Number(costs[j][2] || 0);
-
   // Top 3 CTV theo doanh số trong chu kỳ lọc (kèm gmail)
   var ctvData = sheet_('sheet_ctvs').getDataRange().getValues();
   var gmailByCode = {};
@@ -928,36 +760,13 @@ function getDashboard(p) {
     return s;
   }).sort(function (a, b) { return b.revenue - a.revenue; }).slice(0, 3);
 
-  // Dự báo ngày chạm mốc 2 tỷ: tốc độ TB = tổng doanh thu / số ngày hoạt động
-  var daysActive = firstPaid ? Math.max(1, Math.ceil((Date.now() - firstPaid) / 86400000)) : 1;
-  var avgDaily = rev.total / daysActive;
-  var remaining = Math.max(0, GOAL_TARGET - rev.total);
-  var forecastDays = avgDaily > 0 ? Math.ceil(remaining / avgDaily) : null;
-
-  // Tồn kho CDK
-  var cdkCounts = { available: 0, distributed: 0 };
-  try {
-    var pool = sheet_('sheet_cdk_pool').getDataRange().getValues();
-    for (var q = 1; q < pool.length; q++) {
-      if (String(pool[q][2]) === 'available') cdkCounts.available++; else cdkCounts.distributed++;
-    }
-  } catch (err) {}
-
   return {
     success: true,
     period: period,
     revenue: rev,
     order_counts: counts,
-    expenses: { cogs: cogs, commission_ktv: comKtv, commission_ctv: comCtv, operational: opCost },
-    net_profit: rev.total - (cogs + comKtv + comCtv + opCost),
-    goal: {
-      target: GOAL_TARGET,
-      current: rev.total,
-      percent: Math.min(100, rev.total / GOAL_TARGET * 100),
-      avg_daily: Math.round(avgDaily),
-      forecast_days: forecastDays
-    },
-    top_ctvs: top,
-    cdk_pool: cdkCounts
+    expenses: { cogs: cogs, commission_ktv: comKtv, commission_ctv: comCtv },
+    net_profit: rev.total - (cogs + comKtv + comCtv),
+    top_ctvs: top
   };
 }
